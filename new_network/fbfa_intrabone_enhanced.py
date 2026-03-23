@@ -567,13 +567,15 @@ class FBFAIntraBoneTumorSegmentation(nn.Module):
         # CT特征提取
         if self.freeze_stage1:
             with torch.no_grad():
-                ct_w   = ct * self.ct_center_weight    # [v6] 中心切片加权
-            ct_1ch = self.ct_adapter(ct_w)             # 3ch→1ch
-            ct_features, decoder_feats, bone_logits = self.ct_branch.forward_with_features(ct_1ch)
+                ct_w = ct * self.ct_center_weight
+                ct_1ch = self.ct_adapter(ct_w)
+                ct_features, decoder_feats, bone_logits = \
+                    self.ct_branch.forward_with_features(ct_1ch)
         else:
-            ct_w   = ct * self.ct_center_weight    # [v6] 中心切片加权
-        ct_1ch = self.ct_adapter(ct_w)
-        ct_features, decoder_feats, bone_logits = self.ct_branch.forward_with_features(ct_1ch)
+            ct_w = ct * self.ct_center_weight
+            ct_1ch = self.ct_adapter(ct_w)
+            ct_features, decoder_feats, bone_logits = \
+                self.ct_branch.forward_with_features(ct_1ch)
 
         # 处理骨掩码
         if bone_mask is None:

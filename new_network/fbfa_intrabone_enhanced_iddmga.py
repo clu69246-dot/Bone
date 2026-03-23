@@ -997,8 +997,6 @@ class DGMASupervisionLoss(nn.Module):
                 # 向量化 MSE：对所有有效样本一次计算
                 total = total + self.radius_weight * F.mse_loss(
                     r_pred_mean, r_gt.detach())
-                total = total + self.radius_weight * F.mse_loss(
-                    r_pred_mean, r_gt.detach())
 
         return total
 

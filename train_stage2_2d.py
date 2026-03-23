@@ -351,21 +351,19 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler,
                 clip_grad_norm=1.0):
     model.train()
     freeze_bn_stats(model)
-    metrics_fn = BoneOnlyDetailedMetrics(threshold=0.3)
+    # [FIX] 统一用 threshold=0.5，与推理一致
+    metrics_fn = BoneOnlyDetailedMetrics(threshold=0.5)
 
     total_loss = 0.0
     all_tdice, all_tprec, all_trecall, all_fp = [], [], [], []
+    all_bnd_loss  = []
+    all_bnd_total = []
 
-    # [FIX-5] BoundaryLoss 日志累积列表
-    all_bnd_loss  = []   # boundary_loss 原始值（未乘权重）
-    all_bnd_total = []   # total_loss（用于计算 bnd/total 比例）
-
-    # [FIX-2] 获取本 epoch 的 boundary 权重（用于日志，仅调用一次）
     bnd_w_this_epoch = loss_fn.tumor_loss.get_boundary_weight(epoch)
 
     phase = 1 if epoch < 25 else (2 if epoch < 60 else 3)
     phase_desc = {
-        1: "Phase1[FTL+BCE]",
+        1: "Phase1[FTL+BCE+FP_suppress]",
         2: f"Phase2[+BndLoss bnd_w={bnd_w_this_epoch:.4f}]",
         3: "Phase3[+IRGDA+FP]",
     }[phase]
@@ -385,28 +383,20 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler,
         with autocast():
             outputs = model(ct, pet, bone_pred, return_intermediate=True)
             loss    = loss_fn(outputs, tumor_mask, bone_pred, is_tumor,
-                              current_epoch=epoch,
-                              model=model)
+                              current_epoch=epoch, model=model)
 
-        # 全空 batch 且 Phase1/2（fp_weight=0）→ skip
-        if loss.item() == 0.0 and not is_tumor.any():
-            del ct, pet, bone_pred, tumor_mask, outputs, loss
-            continue
-
-        # [FIX-5] 记录本 batch 的 boundary 子 loss（读取 loss_fn 实例属性）
-        if loss_fn.last_bnd_loss > 0.0:
-            all_bnd_loss.append(loss_fn.last_bnd_loss)
-        if loss_fn.last_total_loss > 0.0:
-            all_bnd_total.append(loss_fn.last_total_loss)
-
-        loss = loss / accumulation_steps
-
+        # [FIX] 不再跳过空batch，因为空切片现在有FP loss梯度
         if torch.isnan(loss) or torch.isinf(loss):
             optimizer.zero_grad(set_to_none=True)
             del ct, pet, bone_pred, tumor_mask, outputs, loss
             continue
 
-        scaler.scale(loss).backward()
+        if loss_fn.last_bnd_loss > 0.0:
+            all_bnd_loss.append(loss_fn.last_bnd_loss)
+        if loss_fn.last_total_loss > 0.0:
+            all_bnd_total.append(loss_fn.last_total_loss)
+
+        (loss / accumulation_steps).backward()
 
         step = (batch_idx + 1) % accumulation_steps == 0
         last = (batch_idx + 1) == len(dataloader)
@@ -419,83 +409,67 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler,
 
         if batch_idx % 10 == 0:
             with torch.no_grad():
+                # [FIX] 使用硬Dice
                 m = metrics_fn(outputs['tumor_logits'], tumor_mask, bone_pred, is_tumor)
                 if m['num_tumor_slices'] > 0:
-                    all_tdice.append(m['tumor_dice'])
+                    all_tdice.append(m['tumor_dice'])      # 现在是硬Dice
                     all_tprec.append(m['tumor_precision'])
                     all_trecall.append(m['tumor_recall'])
                 if m['num_empty_slices'] > 0:
                     all_fp.append(m['empty_fp_rate'])
 
-        total_loss += loss.item() * accumulation_steps
-        cur_prec = np.mean(all_tprec) if all_tprec else 0.0
+        total_loss += loss.item()
         pbar.set_postfix({
-            'loss':   f'{loss.item()*accumulation_steps:.4f}',
-            'dice':   f'{np.mean(all_tdice):.3f}' if all_tdice else '—',
-            'prec':   f'{cur_prec:.3f}',
+            'loss':   f'{loss.item():.4f}',
+            'dice':   f'{np.mean(all_tdice):.3f}'   if all_tdice   else '—',
+            'prec':   f'{np.mean(all_tprec):.3f}'   if all_tprec   else '—',
             'recall': f'{np.mean(all_trecall):.3f}' if all_trecall else '—',
-            # [FIX-5] 实时显示 boundary_weight
-            'bnd_w':  f'{bnd_w_this_epoch:.4f}',
+            'fp':     f'{np.mean(all_fp):.4f}'      if all_fp      else '—',
         })
         del ct, pet, bone_pred, tumor_mask, outputs, loss
 
     n = len(dataloader)
-
-    # [FIX-5] 计算 boundary 统计
     mean_bnd_loss = np.mean(all_bnd_loss)  if all_bnd_loss  else 0.0
     mean_total    = np.mean(all_bnd_total) if all_bnd_total else 1.0
-    # boundary 贡献比例：weighted_bnd / total
-    bnd_ratio = (bnd_w_this_epoch * mean_bnd_loss) / (mean_total + 1e-8) if mean_total > 0 else 0.0
+    bnd_ratio     = (bnd_w_this_epoch * mean_bnd_loss) / (mean_total + 1e-8)
+
+    dice_val   = np.mean(all_tdice)   if all_tdice   else 0.0
+    prec_val   = np.mean(all_tprec)   if all_tprec   else 0.0
+    recall_val = np.mean(all_trecall) if all_trecall else 0.0
+    fp_val     = np.mean(all_fp)      if all_fp      else 0.0
 
     logger.info(f"\n{'='*70}")
     logger.info(f"Epoch {epoch:03d} [TRAIN]  {phase_desc}")
-    logger.info(f"  Loss:           {total_loss/n:.4f}")
-    logger.info(f"  Dice:           {np.mean(all_tdice):.4f}"   if all_tdice   else "  Dice:           N/A")
-    logger.info(f"  Precision:      {np.mean(all_tprec):.4f}"   if all_tprec   else "  Precision:      N/A")
-    logger.info(f"  Recall:         {np.mean(all_trecall):.4f}" if all_trecall else "  Recall:         N/A")
-    logger.info(f"  FP Rate:        {np.mean(all_fp):.4f}"      if all_fp      else "  FP Rate:        N/A")
-    # [FIX-5] Boundary 专项日志
-    logger.info(f"  [Bnd] weight:   {bnd_w_this_epoch:.4f}  "
-                f"raw_loss: {mean_bnd_loss:.4f}  "
-                f"ratio: {bnd_ratio:.4f}  "
-                f"({'active' if bnd_w_this_epoch > 0 else 'disabled'})")
-    if bnd_w_this_epoch > 0 and bnd_ratio > 0.15:
-        logger.warning(f"  ⚠ boundary/total ratio={bnd_ratio:.3f} > 0.15："
-                       f" BoundaryLoss 占比过高，考虑降低 bnd_rampup_rate")
-
-    prec_val = np.mean(all_tprec) if all_tprec else 0.0
-    if all_tprec and prec_val < 0.40:
-        logger.warning(f"  ⚠ Precision={prec_val:.4f} < 0.40 预警：模型倾向于过度预测")
+    logger.info(f"  Loss:      {total_loss/n:.4f}")
+    logger.info(f"  Dice@0.5:  {dice_val:.4f}   ← 硬Dice（已修复）")
+    logger.info(f"  Precision: {prec_val:.4f}")
+    logger.info(f"  Recall:    {recall_val:.4f}")
+    logger.info(f"  FP Rate:   {fp_val:.4f}")
+    logger.info(f"  [Bnd] weight={bnd_w_this_epoch:.4f}  "
+                f"raw={mean_bnd_loss:.4f}  ratio={bnd_ratio:.4f}")
+    if prec_val < 0.40 and dice_val > 0:
+        logger.warning(f"  ⚠ Precision={prec_val:.4f} < 0.40：过度预测")
     logger.info(f"{'='*70}\n")
 
     return {
         'loss':            total_loss / n,
-        'tumor_dice':      np.mean(all_tdice)   if all_tdice   else 0.0,
-        'tumor_precision': np.mean(all_tprec)   if all_tprec   else 0.0,
-        'tumor_recall':    np.mean(all_trecall) if all_trecall else 0.0,
-        'empty_fp_rate':   np.mean(all_fp)      if all_fp      else 0.0,
-        # [FIX-5] boundary 统计，供调用方写 TensorBoard
+        'tumor_dice':      dice_val,
+        'tumor_precision': prec_val,
+        'tumor_recall':    recall_val,
+        'empty_fp_rate':   fp_val,
         'bnd_weight':      bnd_w_this_epoch,
         'bnd_loss':        mean_bnd_loss,
         'bnd_ratio':       bnd_ratio,
     }
 
 
-# ============================================================
-#  Validate（不变逻辑，去掉 ds_epochs 参数依赖）
-# ============================================================
-
 def validate(model, dataloader, loss_fn, device, epoch, logger):
     model.eval()
-    # [v6] 主指标：raw logits @0.5（不依赖后处理，反映模型真实能力）
-    # 辅助：@0.3 置信度监控 + 后处理 Dice 附加报告
-    metrics_fn_05 = BoneOnlyDetailedMetrics(threshold=0.5)
-    metrics_fn_03 = BoneOnlyDetailedMetrics(threshold=0.3)
+    # [FIX] 只用一个metrics_fn，threshold=0.5，用硬Dice
+    metrics_fn = BoneOnlyDetailedMetrics(threshold=0.5)
 
     total_loss = 0.0
-    all_tdice05_raw, all_tprec_raw, all_trecall_raw, all_fp_raw = [], [], [], []
-    all_tdice03     = []
-    all_tdice05_pp  = []   # 后处理后 Dice（仅附加报告）
+    all_dice, all_prec, all_recall, all_fp = [], [], [], []
 
     pbar = tqdm(dataloader, desc=f'Epoch {epoch:03d} [Val]')
     with torch.no_grad():
@@ -508,70 +482,50 @@ def validate(model, dataloader, loss_fn, device, epoch, logger):
 
             with autocast():
                 outputs = model(ct, pet, bone_pred, return_intermediate=True)
-                loss = loss_fn(outputs, tumor_mask, bone_pred, is_tumor,
-                               current_epoch=epoch, model=None)
+                loss    = loss_fn(outputs, tumor_mask, bone_pred, is_tumor,
+                                  current_epoch=epoch, model=None)
 
-            raw_logits = outputs['tumor_logits']
+            logits = outputs['tumor_logits']
+            # [FIX] tumor_dice 现在是硬Dice
+            m = metrics_fn(logits, tumor_mask, bone_pred, is_tumor)
 
-            # ── 主指标：原始 logits @0.5（[v6] 评估真实模型能力）
-            m05 = metrics_fn_05(raw_logits, tumor_mask, bone_pred, is_tumor)
-            if m05['num_tumor_slices'] > 0:
-                all_tdice05_raw.append(m05['tumor_dice'])
-                all_tprec_raw.append(m05['tumor_precision'])
-                all_trecall_raw.append(m05['tumor_recall'])
-            if m05['num_empty_slices'] > 0:
-                all_fp_raw.append(m05['empty_fp_rate'])
-
-            # ── @0.3 置信度监控
-            m03 = metrics_fn_03(raw_logits, tumor_mask, bone_pred, is_tumor)
-            if m03['num_tumor_slices'] > 0:
-                all_tdice03.append(m03['tumor_dice'])
-
-            # ── 后处理附加报告（不作为主指标）
-            pred_probs   = torch.sigmoid(raw_logits)
-            clean_bin    = postprocess_batch(pred_probs, threshold=0.5,
-                                             min_component_pixels=30)
-            clean_logits = (clean_bin * 20.0) - 10.0
-            m05_pp = metrics_fn_05(clean_logits, tumor_mask, bone_pred, is_tumor)
-            if m05_pp['num_tumor_slices'] > 0:
-                all_tdice05_pp.append(m05_pp['tumor_dice'])
+            if m['num_tumor_slices'] > 0:
+                all_dice.append(m['tumor_dice'])
+                all_prec.append(m['tumor_precision'])
+                all_recall.append(m['tumor_recall'])
+            if m['num_empty_slices'] > 0:
+                all_fp.append(m['empty_fp_rate'])
 
             total_loss += loss.item()
             pbar.set_postfix({
-                'dice@0.5': f'{np.mean(all_tdice05_raw):.3f}' if all_tdice05_raw else '—',
-                'dice@0.3': f'{np.mean(all_tdice03):.3f}'     if all_tdice03     else '—',
-                'recall':   f'{np.mean(all_trecall_raw):.3f}' if all_trecall_raw else '—',
-                'fp':       f'{np.mean(all_fp_raw):.3f}'      if all_fp_raw      else '—',
+                'dice':   f'{np.mean(all_dice):.3f}'   if all_dice   else '—',
+                'prec':   f'{np.mean(all_prec):.3f}'   if all_prec   else '—',
+                'recall': f'{np.mean(all_recall):.3f}' if all_recall else '—',
+                'fp':     f'{np.mean(all_fp):.6f}'     if all_fp     else '—',
             })
-            del ct, pet, bone_pred, tumor_mask, outputs, loss, raw_logits, clean_logits
+            del ct, pet, bone_pred, tumor_mask, outputs, loss, logits
 
-    n    = len(dataloader)
-    d05  = np.mean(all_tdice05_raw) if all_tdice05_raw else 0.0
-    d03  = np.mean(all_tdice03)     if all_tdice03     else 0.0
-    d05p = np.mean(all_tdice05_pp)  if all_tdice05_pp  else 0.0
-    conf_gap = d03 - d05
+    n      = len(dataloader)
+    dice   = np.mean(all_dice)   if all_dice   else 0.0
+    prec   = np.mean(all_prec)   if all_prec   else 0.0
+    recall = np.mean(all_recall) if all_recall else 0.0
+    fp     = np.mean(all_fp)     if all_fp     else 0.0
 
     logger.info(f"\n{'='*70}")
     logger.info(f"Epoch {epoch:03d} [VAL]")
-    logger.info(f"  Loss:             {total_loss/n:.4f}")
-    logger.info(f"  Dice@0.5 (raw):   {d05:.4f}  ← 主指标（原始输出，不含后处理）")
-    logger.info(f"  Dice@0.5 (post):  {d05p:.4f}  (后处理参考，非主指标)")
-    logger.info(f"  Dice@0.3 (raw):   {d03:.4f}  (置信度监控)")
-    logger.info(f"  Conf gap:         {conf_gap:+.4f}  (D@0.3 - D@0.5; 负值=低置信)")
-    logger.info(f"  Precision:        {np.mean(all_tprec_raw):.4f}"   if all_tprec_raw   else "  Precision:        N/A")
-    logger.info(f"  Recall:           {np.mean(all_trecall_raw):.4f}" if all_trecall_raw else "  Recall:           N/A")
-    logger.info(f"  FP Rate:          {np.mean(all_fp_raw):.4f}"      if all_fp_raw      else "  FP Rate:          N/A")
+    logger.info(f"  Loss:      {total_loss/n:.4f}")
+    logger.info(f"  Dice@0.5:  {dice:.4f}   ← 硬Dice主指标（已修复）")
+    logger.info(f"  Precision: {prec:.4f}")
+    logger.info(f"  Recall:    {recall:.4f}")
+    logger.info(f"  FP Rate:   {fp:.6f}")
     logger.info(f"{'='*70}\n")
 
     return {
         'loss':            total_loss / n,
-        'tumor_dice':      d05,       # 主指标：raw @0.5
-        'tumor_dice_pp':   d05p,      # 附加：后处理 @0.5
-        'tumor_dice_03':   d03,
-        'confidence_gap':  conf_gap,
-        'tumor_precision': np.mean(all_tprec_raw)   if all_tprec_raw   else 0.0,
-        'tumor_recall':    np.mean(all_trecall_raw) if all_trecall_raw else 0.0,
-        'empty_fp_rate':   np.mean(all_fp_raw)      if all_fp_raw      else 0.0,
+        'tumor_dice':      dice,
+        'tumor_precision': prec,
+        'tumor_recall':    recall,
+        'empty_fp_rate':   fp,
     }
 
 
@@ -592,7 +546,7 @@ def main():
     # 数据
     parser.add_argument('--batch_size',        type=int,      default=4)
     parser.add_argument('--num_workers',       type=int,      default=4)
-    parser.add_argument('--min_tumor_pixels',  type=int,      default=20)
+    parser.add_argument('--min_tumor_pixels',  type=int,      default=100)
     parser.add_argument('--is_16bit',          type=str2bool, default=True)
     parser.add_argument('--train_empty_ratio', type=float,    default=2.0,
                         help='训练集 empty:tumor 比例，2.0 = 1:2 (v5: 提高背景负样本)')  # [v5-I]

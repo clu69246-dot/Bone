@@ -118,12 +118,9 @@ class BoundaryLoss(nn.Module):
 
 class SmallTumorLoss(nn.Module):
     """
-    分阶段小骨肿瘤综合 Loss — v3 BoundaryLoss warmup 专项修复
-
-    BoundaryLoss 调度逻辑:
-      epoch < phase2_start                    → bnd_w = 0.0
-      USE_BOUNDARY_DELAY & epoch < boundary_delay_start → bnd_w = 0.0
-      之后线性 warmup: min(bnd_weight_max, bnd_rampup_rate * steps)
+    修复版 SmallTumorLoss:
+    [FIX] 空切片从 epoch 1 就贡献 FP 抑制梯度（原来 Phase1/2 返回 0）
+    [保持] 所有原有阶段逻辑不变
     """
 
     def __init__(self,
@@ -140,7 +137,8 @@ class SmallTumorLoss(nn.Module):
                  phase2_start=25,
                  use_boundary_delay=True,
                  boundary_delay_start=30,
-                 ds_cutoff=40):
+                 ds_cutoff=40,
+                 fp_weight_base=0.05):       # 新增: 空切片FP基础权重
         super().__init__()
         self.ftl_weight           = ftl_weight
         self.bce_weight           = bce_weight
@@ -151,6 +149,7 @@ class SmallTumorLoss(nn.Module):
         self.use_boundary_delay   = use_boundary_delay
         self.boundary_delay_start = boundary_delay_start
         self.ds_cutoff            = ds_cutoff
+        self.fp_weight_base       = fp_weight_base  # 新增
 
         self.beta  = beta
         self.alpha = alpha
@@ -210,9 +209,20 @@ class SmallTumorLoss(nn.Module):
         self.last_bnd_loss  = 0.0
         self.last_main_loss = 0.0
 
-        if not has_tumor.any():
-            return torch.tensor(0.0, device=tumor_logits.device, requires_grad=True)
+        # ── [FIX] 空切片FP抑制：从epoch 1就生效 ──────────────────
+        # 原来 Phase1/2 对空切片直接 return 0，浪费了2/3的batch
+        # 现在用小权重L2压制骨内区域的虚假预测
+        fp_loss = torch.tensor(0.0, device=tumor_logits.device)
+        if (~has_tumor).any():
+            empty_logits = tumor_logits[~has_tumor]
+            empty_bone   = (bone_pred[~has_tumor] > 0.5).float()
+            prob_in_bone = torch.sigmoid(empty_logits) * empty_bone
+            fp_loss = prob_in_bone.pow(2).mean()
 
+        if not has_tumor.any():
+            return self.fp_weight_base * fp_loss
+
+        # ── 肿瘤切片主损失（原有逻辑不变）──────────────────────────
         idx         = has_tumor.nonzero(as_tuple=True)[0]
         logits_t    = tumor_logits[idx]
         target_t    = tumor_mask[idx]
@@ -222,7 +232,8 @@ class SmallTumorLoss(nn.Module):
         logits_masked = logits_t * bone_pred_t + (bone_pred_t - 1) * 10.0
 
         bnd_w = self.get_boundary_weight(current_epoch)
-        main_loss, main_val, bnd_val = self._single_loss(logits_masked, target_bone, bnd_w)
+        main_loss, main_val, bnd_val = self._single_loss(
+            logits_masked, target_bone, bnd_w)
 
         self.last_bnd_w     = bnd_w
         self.last_bnd_loss  = bnd_val
@@ -237,10 +248,84 @@ class SmallTumorLoss(nn.Module):
                         ds_logit = F.interpolate(ds_logit, size=target_bone.shape[2:],
                                                  mode='bilinear', align_corners=False)
                     ds_logit_m = ds_logit * bone_pred_t + (bone_pred_t - 1) * 10.0
-                    ds_total, _, _ = self._single_loss(ds_logit_m, target_bone, bnd_w=0.0)
+                    ds_total, _, _ = self._single_loss(
+                        ds_logit_m, target_bone, bnd_w=0.0)
                     ds_loss = ds_loss + ds_total
 
-        return main_loss + self.ds_weight * ds_loss
+        return main_loss + self.ds_weight * ds_loss + self.fp_weight_base * fp_loss
+
+
+class BoneOnlyDetailedMetrics:
+    """
+    修复版:
+    [FIX] 所有对外报告的dice统一使用 tumor_dice_hard（硬阈值）
+    [FIX] tumor_dice_hard 作为主指标，tumor_dice(软) 保留但不再对外暴露为主指标
+    threshold默认0.5，与推理一致
+    """
+
+    def __init__(self, threshold=0.5, smooth=1.0):
+        self.threshold = threshold
+        self.smooth    = smooth
+
+    def soft_dice_coeff(self, y_true, y_pred):
+        inter = torch.sum(y_true * y_pred)
+        union = torch.sum(y_true) + torch.sum(y_pred)
+        return (2.0 * inter + self.smooth) / (union + self.smooth)
+
+    def __call__(self, logits, target, bone_pred, is_tumor):
+        has_tumor = is_tumor.bool()
+        if not has_tumor.any():
+            return dict(
+                num_tumor_slices = 0,
+                num_empty_slices = has_tumor.numel(),
+                tumor_dice       = 0.0,   # 硬Dice（主指标）
+                tumor_dice_hard  = 0.0,
+                tumor_precision  = 0.0,
+                tumor_recall     = 0.0,
+                tumor_size_ratio = 0.0,
+                empty_fp_rate    = 0.0,
+            )
+
+        logits_t    = logits[has_tumor]
+        target_t    = target[has_tumor]
+        bone_pred_t = bone_pred[has_tumor]
+
+        pred_prob   = torch.sigmoid(logits_t)
+        pred_bone   = pred_prob * bone_pred_t
+        target_bone = target_t * bone_pred_t
+
+        # 硬Dice（主指标）
+        pred_binary      = (pred_prob > self.threshold).float()
+        pred_binary_bone = pred_binary * bone_pred_t
+        hard_dice        = self.soft_dice_coeff(target_bone, pred_binary_bone).item()
+
+        tp = (pred_binary_bone * target_bone).sum()
+        fp = (pred_binary_bone * (1 - target_bone)).sum()
+        fn = ((1 - pred_binary_bone) * target_bone).sum()
+
+        precision  = (tp / (tp + fp + 1e-6)).item()
+        recall     = (tp / (tp + fn + 1e-6)).item()
+        size_ratio = (pred_binary_bone.sum() / (target_bone.sum() + 1e-6)).item()
+
+        empty_fp_rate = 0.0
+        if (~has_tumor).any():
+            logits_empty    = logits[~has_tumor]
+            bone_pred_empty = bone_pred[~has_tumor]
+            pred_empty      = (torch.sigmoid(logits_empty) > self.threshold).float()
+            fp_pixels       = (pred_empty * bone_pred_empty).sum()
+            total_bone      = bone_pred_empty.sum()
+            empty_fp_rate   = (fp_pixels / (total_bone + 1e-6)).item()
+
+        return dict(
+            num_tumor_slices = has_tumor.sum().item(),
+            num_empty_slices = (~has_tumor).sum().item(),
+            tumor_dice       = hard_dice,   # [FIX] 对外统一返回硬Dice
+            tumor_dice_hard  = hard_dice,
+            tumor_precision  = precision,
+            tumor_recall     = recall,
+            tumor_size_ratio = size_ratio,
+            empty_fp_rate    = empty_fp_rate,
+        )
 
 
 # ============================================================
