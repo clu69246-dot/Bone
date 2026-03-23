@@ -89,7 +89,7 @@ def generate_rotated_gaussian(
     sigma_x: torch.Tensor, # (B, K, 1, 1) x 轴标准差
     sigma_y: torch.Tensor, # (B, K, 1, 1) y 轴标准差
     theta: torch.Tensor,   # (B, K, 1, 1) 旋转角 ∈ [-π, π]
-    eps: float = 1e-6
+    eps: float = 1e-4   # [P0-2] 1e-6→1e-4: 防止高斯指数分母趋零导致 NaN
 ) -> torch.Tensor:
     """
     批量生成各向异性旋转椭圆高斯图
@@ -115,10 +115,13 @@ def generate_rotated_gaussian(
     x_rot =  cos_t * dx + sin_t * dy
     y_rot = -sin_t * dx + cos_t * dy
 
-    return torch.exp(
-        -(x_rot ** 2 / (2.0 * sigma_x ** 2 + eps)
-        + y_rot ** 2 / (2.0 * sigma_y ** 2 + eps))
-    )
+    # [P0-2] 对 sigma 做二次保护：即使上游 clamp 失效也不会产生 NaN
+    sigma_x = sigma_x.clamp_min(0.10)
+    sigma_y = sigma_y.clamp_min(0.10)
+    exponent = -(x_rot ** 2 / (2.0 * sigma_x ** 2 + eps)
+               + y_rot ** 2 / (2.0 * sigma_y ** 2 + eps))
+    # clamp exponent 防止极端负值 exp(-inf) = 0 溢出为 NaN（AMP fp16 下-80以下变 inf）
+    return torch.exp(exponent.clamp(min=-80.0))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -347,7 +350,7 @@ class DGMAParamPredictor(nn.Module):
     """
 
     def __init__(self, channels: int,
-                 sigma_min: float = 0.05,
+                 sigma_min: float = 0.08,  # [P0-2] 0.05→0.08: 强制更宽高斯核，防止尖峰 NaN
                  sigma_max: float = 0.45,
                  prior_aspect_ratio: float = 1.5,
                  sigma_residual_max: float = 0.08):
@@ -495,7 +498,7 @@ def build_gaussian_mixture_attention(
     # Step5: 加权混合
     # weight: (B, K_max, 1, 1)；先归一化 weight，再加权求和
     masked_weight = weight * mask_4d                       # (B, K_max, 1, 1)
-    weight_sum    = masked_weight.sum(dim=1, keepdim=True).clamp(min=1e-6)  # (B, 1, 1, 1)
+    weight_sum    = masked_weight.sum(dim=1, keepdim=True).clamp(min=1e-3)  # [P0-2] 1e-6→1e-3
     norm_weight   = masked_weight / weight_sum             # 归一化权重
 
     # (B, K_max, H, W) * (B, K_max, 1, 1) → sum over K → (B, 1, H, W)
@@ -551,7 +554,7 @@ class DGMA(nn.Module):
         nms_threshold: float   = 0.3,
         r_min: float           = 0.03,
         r_max: float           = 0.40,
-        sigma_min: float       = 0.05,
+        sigma_min: float       = 0.08,  # [P0-2] 0.05→0.08
         sigma_max: float       = 0.45,
         prior_aspect_ratio: float = 1.5,
         sigma_residual_max: float = 0.08,
@@ -736,7 +739,7 @@ class DGMAWithSOE(nn.Module):
         nms_threshold: float   = 0.3,
         r_min: float           = 0.03,
         r_max: float           = 0.40,
-        sigma_min: float       = 0.05,
+        sigma_min: float       = 0.08,  # [P0-2] 0.05→0.08
         sigma_max: float       = 0.45,
         prior_aspect_ratio: float = 1.5,
         sigma_residual_max: float = 0.08,
@@ -1021,7 +1024,7 @@ if __name__ == '__main__':
 
         dgma = DGMA(channels=C, K_max=5, nms_threshold=0.3,
                     r_min=0.03, r_max=0.40,
-                    sigma_min=0.05, sigma_max=0.45).to(device)
+                    sigma_min=0.08, sigma_max=0.45).to(device)
 
         n_heatmap = sum(p.numel() for p in dgma.heatmap_predictor.parameters())
         n_radius  = sum(p.numel() for p in dgma.radius_predictor.parameters())

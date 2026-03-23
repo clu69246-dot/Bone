@@ -36,6 +36,25 @@ from new_network.fbfa_intrabone_enhanced_iddmga import DGMAWithSOE, compute_spat
 # 改动：去掉空间注意力分支，仅保留通道 squeeze-excitation；
 #       参数量和 FLOPs 约为原 CBAM 的 50%，接口与 CBAM 完全兼容（同名、同签名）。
 
+
+# ==================== DepthwiseSeparableConv: 轻量 3×3 卷积替代 ====================
+# DW-Sep 将 Conv2d(in,out,3) 拆成：
+#   DWConv(in,in,3,groups=in) → 只做空间滤波，每通道独立
+#   PWConv(in,out,1)          → 通道混合
+# 参数量: in×9 + in×out  vs  原始 in×out×9 （节省 ~8× 当 in≈out）
+# 接口兼容：可直接替换 nn.Sequential 中的 Conv2d(2C,C,3)
+
+class DepthwiseSeparableConv(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=3, padding=1, bias=False):
+        super().__init__()
+        self.dw = nn.Conv2d(in_channels, in_channels, kernel_size,
+                            padding=padding, groups=in_channels, bias=bias)
+        self.pw = nn.Conv2d(in_channels, out_channels, 1, bias=bias)
+
+    def forward(self, x):
+        return self.pw(self.dw(x))
+
+
 class CBAM(nn.Module):
     """LightSE：轻量通道注意力，接口兼容原 CBAM。
     仅做全局平均池化 → 两层 FC → Sigmoid → 通道缩放，去掉空间注意力分支。
@@ -246,20 +265,22 @@ class FBFAFusionSingleScaleIntraBone(nn.Module):
         self.fg_predictor = IntraBoneForegroundPredictor(channels)
 
         # ② 频率感知融合路径
-        # low 分支：3×3 卷积，感受野更大，匹配低频全局语义
+        # [简化] low 分支：3×3 全卷积 → DepthwiseSeparableConv
+        #   Conv2d(2C,C,3) 参数量 2C×C×9，DW-Sep 仅 2C×9+2C×C，节省约 80%
+        #   感受野完全不变（DW 仍是 3×3），表达能力几乎等价
         self.fusion_low_fg = nn.Sequential(
-            nn.Conv2d(channels * 2, channels, 3, padding=1, bias=False),
+            DepthwiseSeparableConv(channels * 2, channels, 3, padding=1),
             nn.BatchNorm2d(channels),
             nn.ReLU(inplace=True),
             CBAM(channels, reduction)
         )
         self.fusion_low_bg = nn.Sequential(
-            nn.Conv2d(channels * 2, channels, 3, padding=1, bias=False),
+            DepthwiseSeparableConv(channels * 2, channels, 3, padding=1),
             nn.BatchNorm2d(channels),
             nn.ReLU(inplace=True),
             CBAM(channels, reduction)
         )
-        # high 分支：1×1 卷积，轻量，匹配局部高频纹理细节
+        # high 分支：1×1 卷积保持不变（已是最轻量，无需改动）
         self.fusion_high_fg = nn.Sequential(
             nn.Conv2d(channels * 2, channels, 1, bias=False),
             nn.BatchNorm2d(channels),
@@ -360,8 +381,11 @@ class MultiScaleDecoderBlock(nn.Module):
         self.upsample = nn.Upsample(scale_factor=scale, mode='bilinear',
                                     align_corners=True) if scale > 1 else nn.Identity()
 
+        # [简化] 第一个 3×3 大卷积（输入通道最多，最贵）→ DW-Sep
+        #   Conv2d(in+skip, out, 3) → DW-Sep，节省约 80% 参数
+        #   第二个 Conv2d(out, out, 3) 保留全卷积（维持输出特征质量）
         self.conv = nn.Sequential(
-            nn.Conv2d(in_channels + skip_channels, out_channels, 3, padding=1, bias=False),
+            DepthwiseSeparableConv(in_channels + skip_channels, out_channels, 3, padding=1),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(inplace=True),
             CBAM(out_channels, reduction=8),
@@ -419,7 +443,7 @@ class FBFAIntraBoneTumorSegmentation(nn.Module):
                  dgma_K_max: int           = 8,     # 每张切片最多检测的病灶中心数
                  dgma_nms_threshold: float = 0.3,   # NMS 峰值置信度阈值
                  dgma_r_min: float         = 0.03,  # 半径图最小值（归一化坐标）
-                 dgma_r_max: float         = 0.40,  # 半径图最大值（归一化坐标）
+                 dgma_r_max: float         = 0.25,  # [v5-5] 0.40→0.25 收缩注意力半径，防扩散到骨髓
                  dgma_min_spatial_size: int = 65,   # 低于此分辨率的特征图跳过 DGMA (strides=[2,2,2,1]下: scale2=H64跳过✓)
                  ):
         super().__init__()
@@ -428,6 +452,24 @@ class FBFAIntraBoneTumorSegmentation(nn.Module):
         self.bone_dilation = bone_dilation
         self.enable_deep_supervision = enable_deep_supervision
         self.use_bone_constraint = use_bone_constraint
+
+        # [v6] 2.5D 输入适配器
+        # Step 1: 可学习中心通道权重，告诉模型哪层是 t（初始化: prev=0.25, center=1.0, next=0.25）
+        self.ct_center_weight  = nn.Parameter(
+            torch.tensor([0.25, 1.0, 0.25]).view(1, 3, 1, 1))
+        self.pet_center_weight = nn.Parameter(
+            torch.tensor([0.25, 1.0, 0.25]).view(1, 3, 1, 1))
+        # Step 2: 加权后 3ch→1ch 压缩送入各自分支
+        self.ct_adapter = nn.Sequential(
+            nn.Conv2d(3, 1, kernel_size=1, bias=False),
+            nn.BatchNorm2d(1),
+            nn.ReLU(inplace=True),
+        )
+        self.pet_adapter = nn.Sequential(
+            nn.Conv2d(3, 1, kernel_size=1, bias=False),
+            nn.BatchNorm2d(1),
+            nn.ReLU(inplace=True),
+        )
 
         # Stage1: CT分支
         from network.model_efficientvim_2d_stage1 import ConDSeg2DStage1_EfficientViM
@@ -467,7 +509,7 @@ class FBFAIntraBoneTumorSegmentation(nn.Module):
         # stage0 的 SSM 状态维度从 49 降到 16，SSM 递归代价再降 ~3×；
         # state_dim 主要影响 Mamba 的"记忆容量"，对局部病灶检测影响有限。
         self.pet_backbone = MambaFeatureExtractor2D(
-            in_dim=1,
+            in_dim=1,           # [v6] pet_adapter 已压缩为 1ch
             embed_dim=channels_list,
             depths=[2, 2, 2, 2],
             state_dim=[16, 25, 9, 9],
@@ -525,9 +567,13 @@ class FBFAIntraBoneTumorSegmentation(nn.Module):
         # CT特征提取
         if self.freeze_stage1:
             with torch.no_grad():
-                ct_features, decoder_feats, bone_logits = self.ct_branch.forward_with_features(ct)
+                ct_w   = ct * self.ct_center_weight    # [v6] 中心切片加权
+            ct_1ch = self.ct_adapter(ct_w)             # 3ch→1ch
+            ct_features, decoder_feats, bone_logits = self.ct_branch.forward_with_features(ct_1ch)
         else:
-            ct_features, decoder_feats, bone_logits = self.ct_branch.forward_with_features(ct)
+            ct_w   = ct * self.ct_center_weight    # [v6] 中心切片加权
+        ct_1ch = self.ct_adapter(ct_w)
+        ct_features, decoder_feats, bone_logits = self.ct_branch.forward_with_features(ct_1ch)
 
         # 处理骨掩码
         if bone_mask is None:
@@ -542,7 +588,9 @@ class FBFAIntraBoneTumorSegmentation(nn.Module):
             mask_valid = (bone_mask.sum(dim=(1, 2, 3)) > 0).float()
 
         # PET特征提取
-        pet_features = self.pet_backbone(pet_bone)
+        pet_w        = pet_bone * self.pet_center_weight  # [v6] 中心切片加权
+        pet_bone_1ch = self.pet_adapter(pet_w)
+        pet_features = self.pet_backbone(pet_bone_1ch)
 
         # 特征对齐
         def align(src, tgt):
