@@ -255,78 +255,6 @@ class SmallTumorLoss(nn.Module):
         return main_loss + self.ds_weight * ds_loss + self.fp_weight_base * fp_loss
 
 
-class BoneOnlyDetailedMetrics:
-    """
-    修复版:
-    [FIX] 所有对外报告的dice统一使用 tumor_dice_hard（硬阈值）
-    [FIX] tumor_dice_hard 作为主指标，tumor_dice(软) 保留但不再对外暴露为主指标
-    threshold默认0.5，与推理一致
-    """
-
-    def __init__(self, threshold=0.5, smooth=1.0):
-        self.threshold = threshold
-        self.smooth    = smooth
-
-    def soft_dice_coeff(self, y_true, y_pred):
-        inter = torch.sum(y_true * y_pred)
-        union = torch.sum(y_true) + torch.sum(y_pred)
-        return (2.0 * inter + self.smooth) / (union + self.smooth)
-
-    def __call__(self, logits, target, bone_pred, is_tumor):
-        has_tumor = is_tumor.bool()
-        if not has_tumor.any():
-            return dict(
-                num_tumor_slices = 0,
-                num_empty_slices = has_tumor.numel(),
-                tumor_dice       = 0.0,   # 硬Dice（主指标）
-                tumor_dice_hard  = 0.0,
-                tumor_precision  = 0.0,
-                tumor_recall     = 0.0,
-                tumor_size_ratio = 0.0,
-                empty_fp_rate    = 0.0,
-            )
-
-        logits_t    = logits[has_tumor]
-        target_t    = target[has_tumor]
-        bone_pred_t = bone_pred[has_tumor]
-
-        pred_prob   = torch.sigmoid(logits_t)
-        pred_bone   = pred_prob * bone_pred_t
-        target_bone = target_t * bone_pred_t
-
-        # 硬Dice（主指标）
-        pred_binary      = (pred_prob > self.threshold).float()
-        pred_binary_bone = pred_binary * bone_pred_t
-        hard_dice        = self.soft_dice_coeff(target_bone, pred_binary_bone).item()
-
-        tp = (pred_binary_bone * target_bone).sum()
-        fp = (pred_binary_bone * (1 - target_bone)).sum()
-        fn = ((1 - pred_binary_bone) * target_bone).sum()
-
-        precision  = (tp / (tp + fp + 1e-6)).item()
-        recall     = (tp / (tp + fn + 1e-6)).item()
-        size_ratio = (pred_binary_bone.sum() / (target_bone.sum() + 1e-6)).item()
-
-        empty_fp_rate = 0.0
-        if (~has_tumor).any():
-            logits_empty    = logits[~has_tumor]
-            bone_pred_empty = bone_pred[~has_tumor]
-            pred_empty      = (torch.sigmoid(logits_empty) > self.threshold).float()
-            fp_pixels       = (pred_empty * bone_pred_empty).sum()
-            total_bone      = bone_pred_empty.sum()
-            empty_fp_rate   = (fp_pixels / (total_bone + 1e-6)).item()
-
-        return dict(
-            num_tumor_slices = has_tumor.sum().item(),
-            num_empty_slices = (~has_tumor).sum().item(),
-            tumor_dice       = hard_dice,   # [FIX] 对外统一返回硬Dice
-            tumor_dice_hard  = hard_dice,
-            tumor_precision  = precision,
-            tumor_recall     = recall,
-            tumor_size_ratio = size_ratio,
-            empty_fp_rate    = empty_fp_rate,
-        )
-
 
 # ============================================================
 #  SingleStageLoss — 分阶段版 [v3 不变]
@@ -521,16 +449,17 @@ class BoneOnlyDetailedMetrics:
             total_bone      = bone_pred_empty.sum()
             empty_fp_rate   = (fp_pixels / (total_bone + 1e-6)).item()
 
+        # 在第二个 BoneOnlyDetailedMetrics.__call__ 里，改这一行
         return dict(
-            num_tumor_slices = has_tumor.sum().item(),
-            num_empty_slices = (~has_tumor).sum().item(),
-            tumor_dice       = soft_dice,
-            tumor_dice_hard  = hard_dice,
-            tumor_dice_at_03 = dice_at_03,   # [FIX-7] 新增
-            tumor_precision  = precision,
-            tumor_recall     = recall,
-            tumor_size_ratio = size_ratio,
-            empty_fp_rate    = empty_fp_rate
+            num_tumor_slices=has_tumor.sum().item(),
+            num_empty_slices=(~has_tumor).sum().item(),
+            tumor_dice=hard_dice,  # ← 改为 hard_dice，不是 soft_dice
+            tumor_dice_hard=hard_dice,
+            tumor_dice_at_03=dice_at_03,
+            tumor_precision=precision,
+            tumor_recall=recall,
+            tumor_size_ratio=size_ratio,
+            empty_fp_rate=empty_fp_rate
         )
 
 

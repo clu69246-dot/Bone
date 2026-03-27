@@ -1,27 +1,24 @@
 """
-Intra-Bone Tumor Training — 分阶段稳定收敛版 v6
-=================================================
+Intra-Bone Tumor Training — 分阶段稳定收敛版 v7 (5-Slice CSA)
+==============================================================
 
-v5 在 v4 基础上针对 Precision 过低（≈0.51）的专项修复，目标 Dice ≥ 0.70：
+v7 在 v6 基础上完成 5-Slice CSA 迁移：
 
-  [v5-A] Tversky alpha/beta 初始值调整：alpha 0.3→0.4, beta 0.7→0.6
-         增加对 FP 的惩罚，减少过度预测
-  [v5-B] gamma 从 1.5 提高至 2.0，让难分 FP 区域获得更大惩罚梯度
-  [v5-C] Phase2 动态切换（epoch25）：alpha→0.55, beta→0.45（精度优先模式）
-  [v5-D] BoundaryLoss 提前至 epoch15 启动（原 epoch30），bnd_weight_max 0.03→0.05
-  [v5-E] phase2_start 提前至 epoch20（原 25），phase3_start 提前至 epoch35（原 60）
-  [v5-F] validate() 接入 postprocess_batch 后处理（CC 过滤，min_pixels=30）
-  [v5-G] main_lr 提高至 2e-4（原 1e-4）
-  [v5-H] cosine_T0 从 30 拉长至 50（防学习率过快衰减，改用 CosineAnnealingWarmRestarts）
-  [v5-I] train_empty_ratio 1.0→2.0（每 batch tumor:empty = 1:2）
-  [v5-J] 验证指标新增 Dice@0.5 / Dice@0.3 双阈值 + confidence_gap 监控
-  [v5-K] 保存条件：prec≥0.35, recall≥0.55（放宽自 0.45/0.65）
+  [v7-A] Dataset 升级为 5-Slice 版本（PerfectIntraBoneDataset512_5Slice）
+         输出 ct=(5,H,W), pet=(5,H,W)，兼容 CSASliceFusion
+  [v7-B] 模型引入 CSASliceFusion 替换原 ct_adapter/pet_adapter
+         参数：n_slices=5, csa_feat_ch=32, csa_n_heads=4,
+               csa_pool_size=16, csa_use_cross_modal=True
+  [v7-C] Optimizer 新增 CSA 参数组（与 main 同 LR，5 epoch warmup）
+  [v7-D] argparse 新增 CSA 超参（--n_slices, --csa_feat_ch, 等）
+  [v7-E] 消除 min_tumor_pixels 过滤，包含所有肿瘤切片（含极小肿瘤）
 
-v4 沿用项:
-  [v4-A] freeze_stage1=True
-  [v4-B] beta 切换 epoch 60→（v5 已提前至 25）
-  [v4-C] GroupNorm 替换 BatchNorm2d
-  [v4-D] state_dim [32, 25, 9, 9]
+v6 沿用项（均保留）:
+  [v6-A] HardNegativeDataset（难负样本）替换随机空切片
+  [v6-B] CosineAnnealingWarmRestarts T0=80 Tmult=2
+  [v6-C] Phase2 温和精度优化（alpha=0.48, beta=0.52，保 Recall≥0.68）
+  [v6-D] EmptySliceDataset 随机补充不足时使用
+  [v6-E] early_stop_patience=50（保证 Phase3 IRGDA 充分训练后再早停）
 
 训练阶段:
   Phase 1  epoch  1~19 : FTL + BCE（建立分割基础）
@@ -30,7 +27,8 @@ v4 沿用项:
 
 Deep Supervision:  epoch 1~40 开启，epoch > 40 关闭
 Sampler:           BalancedBatchSampler（N/3 tumor + 2N/3 empty per batch，1:2）
-Scheduler:         CosineAnnealingWarmRestarts T0=50 Tmult=2
+Scheduler:         CosineAnnealingWarmRestarts T0=80 Tmult=2
+CSA Warmup:        前 5 epoch CSA LR 从 0 线性升至 main_lr
 """
 
 import os
@@ -61,18 +59,24 @@ if sys.platform == "win32":
 warnings.filterwarnings('ignore')
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from new_train.Intrabone_petct_dataset_tumor_only import (
-    get_intrabone_dataloader_512,
-    PerfectIntraBoneDataset512Fixed,
-    HardNegativeDataset,          # [v6] hard negative
+# ─────────────────────────────────────────────────────────────────────────────
+# [CHANGE-1] Import — 5-Slice CSA 版（已替换原 tumor_only 版本）
+# ─────────────────────────────────────────────────────────────────────────────
+from new_train.Intrabone_petct_dataset_5slice import (
+    get_intrabone_dataloader_5slice          as get_intrabone_dataloader_512,  # 向后兼容别名
+    PerfectIntraBoneDataset512_5Slice        as PerfectIntraBoneDataset512Fixed,
+    HardNegativeDataset5Slice                as HardNegativeDataset,
     EnhancedCTNormalizer,
     EnhancedPETNormalizer,
-    get_augmentation,
+    get_augmentation_5slice                  as get_augmentation,
+    parse_patient_slice,
+    build_patient_slice_map,
+)
+from new_network.fbfa_intrabone_enhanced_5slice import (
+    FBFAIntraBoneTumorSegmentation5Slice     as FBFAIntraBoneTumorSegmentation,
 )
 
-from new_network.fbfa_intrabone_enhanced import FBFAIntraBoneTumorSegmentation
-
-# [FIX] 使用 v3 分阶段 loss（BoundaryLoss warmup + 数值稳定）
+# Loss / Metrics
 from bone_only_loss_metrics import (
     SmallTumorLoss,
     SingleStageLoss,
@@ -82,7 +86,7 @@ from bone_only_loss_metrics import (
 
 
 # ============================================================
-#  工具函数（不变）
+#  工具函数
 # ============================================================
 
 def setup_logger(log_file):
@@ -118,6 +122,7 @@ def str2bool(v):
 
 
 def freeze_bn_stats(model):
+    """冻结 ct_branch BN 统计量；CSA 模块有独立 BN，不受影响。"""
     for m in model.ct_branch.modules():
         if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
             m.eval()
@@ -148,11 +153,17 @@ class EarlyStopping:
 
 
 # ============================================================
-#  EmptySliceDataset（不变）
+# [CHANGE-2] EmptySliceDataset — 5-Slice 版
 # ============================================================
 
 class EmptySliceDataset(torch.utils.data.Dataset):
-    """读取空切片（is_tumor=False）— [v6] 已升级为 2.5D 三通道接口"""
+    """
+    读取空切片（骨内无肿瘤）— [v7] 5-Slice 版
+
+    输出 ct=(5,H,W), pet=(5,H,W)，与 PerfectIntraBoneDataset512_5Slice 接口一致。
+    注：_filter_empty 仅过滤「骨区域面积 < 500」的无效切片，
+        保留所有骨内无肿瘤的切片作为负样本，不做肿瘤像素数过滤。
+    """
 
     def __init__(self, image_list, img_root, mode='train', is_16bit=True):
         self.img_root  = img_root
@@ -161,8 +172,16 @@ class EmptySliceDataset(torch.utils.data.Dataset):
         self.ct_norm   = EnhancedCTNormalizer()
         self.pet_norm  = EnhancedPETNormalizer()
         self.transform = get_augmentation(is_train=(mode == 'train'))
+
+        # 构建邻切片索引
+        pmap = build_patient_slice_map(image_list)
+        self._zmap = {}
+        for patient, entries in pmap.items():
+            for z, iid in entries:
+                self._zmap[(patient, z)] = iid
+
         self.image_list = self._filter_empty(image_list)
-        print(f"  [EmptySlice] {len(self.image_list)} empty slices loaded")
+        print(f"  [EmptySlice 5-slice] {len(self.image_list)} empty slices loaded")
 
     def _get_path(self, image_id, suffix):
         p = os.path.join(self.img_root, image_id + suffix)
@@ -176,12 +195,17 @@ class EmptySliceDataset(torch.utils.data.Dataset):
         return p
 
     def _get_bone_path(self, image_id):
-        p = self._get_path(image_id, '_bone_pred.png')
-        if os.path.exists(p):
-            return p
         return self._get_path(image_id, '_bone_pred.png')
 
+    def _neighbor_id(self, image_id, delta):
+        patient, z = parse_patient_slice(image_id)
+        if z is None:
+            return image_id
+        nb = self._zmap.get((patient, z + delta))
+        return nb if nb is not None else image_id
+
     def _filter_empty(self, raw_list):
+        """保留骨区域 >= 500 且骨内无肿瘤的切片作为负样本。"""
         result = []
         for image_id in raw_list:
             tmask = self._get_path(image_id, '_mask.png')
@@ -200,39 +224,59 @@ class EmptySliceDataset(torch.utils.data.Dataset):
                 result.append(image_id)
         return result
 
+    def _load_ct5(self, image_id):
+        slices = []
+        for d in (-2, -1, 0, 1, 2):
+            nid = self._neighbor_id(image_id, d)
+            try:
+                p = self._get_path(nid, '_CT.png')
+                if self.is_16bit:
+                    raw = cv2.imread(p, cv2.IMREAD_UNCHANGED)
+                    s = self.ct_norm.normalize(raw, method='bone')
+                else:
+                    raw = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
+                    s = raw.astype(np.float32) / 255.0
+            except Exception:
+                p0  = self._get_path(image_id, '_CT.png')
+                raw = cv2.imread(p0, cv2.IMREAD_UNCHANGED if self.is_16bit
+                                 else cv2.IMREAD_GRAYSCALE)
+                s = self.ct_norm.normalize(raw, 'bone') if self.is_16bit \
+                    else raw.astype(np.float32) / 255.0
+            slices.append(s)
+        return np.stack(slices, axis=-1)   # (H, W, 5)
+
+    def _load_pet5(self, image_id):
+        slices = []
+        for d in (-2, -1, 0, 1, 2):
+            nid = self._neighbor_id(image_id, d)
+            try:
+                p   = self._get_path(nid, '_PET.png')
+                raw = cv2.imread(p, cv2.IMREAD_UNCHANGED)
+                s   = self.pet_norm.normalize(raw)
+            except Exception:
+                p0  = self._get_path(image_id, '_PET.png')
+                raw = cv2.imread(p0, cv2.IMREAD_UNCHANGED)
+                s   = self.pet_norm.normalize(raw)
+            slices.append(s)
+        return np.stack(slices, axis=-1)   # (H, W, 5)
+
     def __len__(self):
         return len(self.image_list)
 
     def __getitem__(self, idx):
         image_id   = self.image_list[idx]
-        ct_path    = self._get_path(image_id, '_CT.png')
-        pet_path   = self._get_path(image_id, '_PET.png')
-        tmask_path = self._get_path(image_id, '_mask.png')
+        ct5ch      = self._load_ct5(image_id)     # (H, W, 5)
+        pet5ch     = self._load_pet5(image_id)    # (H, W, 5)
         bone_path  = self._get_bone_path(image_id)
+        bone_raw   = cv2.imread(bone_path, cv2.IMREAD_GRAYSCALE)
+        bone_pred  = (bone_raw  > 127).astype(np.float32) \
+                     if bone_raw  is not None else np.zeros((512, 512), np.float32)
+        tumor_mask = np.zeros_like(bone_pred)
 
-        def read_ct(p):
-            if self.is_16bit:
-                ct = cv2.imread(p, cv2.IMREAD_UNCHANGED)
-                return self.ct_norm.normalize(ct, method='bone')
-            return cv2.imread(p, cv2.IMREAD_GRAYSCALE).astype(np.float32) / 255.0
-
-        ct_2d     = read_ct(ct_path)                             # (H, W)
-        pet_raw   = cv2.imread(pet_path, cv2.IMREAD_UNCHANGED)
-        pet_2d    = self.pet_norm.normalize(pet_raw)             # (H, W)
-        tmask_raw = cv2.imread(tmask_path, cv2.IMREAD_GRAYSCALE)
-        bone_raw  = cv2.imread(bone_path,  cv2.IMREAD_GRAYSCALE)
-
-        tumor_mask = (tmask_raw > 127).astype(np.float32)
-        bone_pred  = (bone_raw  > 127).astype(np.float32)
-
-        # [v6] 单切片复制为三通道 (H,W,3) 与 2.5D 接口一致
-        ct3ch  = np.stack([ct_2d,  ct_2d,  ct_2d],  axis=-1)   # (H, W, 3)
-        pet3ch = np.stack([pet_2d, pet_2d, pet_2d],  axis=-1)  # (H, W, 3)
-
-        aug        = self.transform(image=ct3ch, pet3ch=pet3ch,
+        aug        = self.transform(image=ct5ch, pet5ch=pet5ch,
                                     bone_pred=bone_pred, tumor_mask=tumor_mask)
-        ct         = aug['image'].float()       # (3, H, W) after ToTensorV2
-        pet        = aug['pet3ch'].float()      # (3, H, W)
+        ct         = aug['image'].float()       # (5, H, W)
+        pet        = aug['pet5ch'].float()      # (5, H, W)
         bone_pred  = aug['bone_pred'].float()
         tumor_mask = aug['tumor_mask'].float()
 
@@ -240,41 +284,36 @@ class EmptySliceDataset(torch.utils.data.Dataset):
         bone_pred  = e3(bone_pred)
         tumor_mask = e3(tumor_mask)
 
-        ct         = torch.clamp(ct,  0, 1)   # [v6-fix] 不遮盖，保留上下文
+        ct         = torch.clamp(ct,  0, 1)
         pet        = torch.clamp(pet, 0, 1)
         bone_pred  = (bone_pred  > 0.5).float()
-        tumor_mask = (tumor_mask > 0.5).float() * bone_pred  # label 仍限在骨内
+        tumor_mask = (tumor_mask > 0.5).float() * bone_pred
 
         return {
-            'ct':          ct,           # (3, H, W)
-            'pet':         pet,          # (3, H, W)
-            'bone_pred':   bone_pred,    # (1, H, W)
-            'tumor_mask':  tumor_mask,   # (1, H, W)
+            'ct':          ct,
+            'pet':         pet,
+            'bone_pred':   bone_pred,
+            'tumor_mask':  tumor_mask,
             'name':        image_id,
-            'tumor_ratio': torch.tensor(0.0,   dtype=torch.float32),
-            'is_tumor':    torch.tensor(False,  dtype=torch.bool),
+            'tumor_ratio': torch.tensor(0.0,  dtype=torch.float32),
+            'is_tumor':    torch.tensor(False, dtype=torch.bool),
         }
 
 
 # ============================================================
-#  [MODIFIED] BalancedBatchSampler — 替换 WeightedRandomSampler
+#  BalancedBatchSampler
 # ============================================================
 
 class BalancedBatchSampler(Sampler):
     """
-    [MODIFIED] 每个 batch 保证 tumor_per_batch 个 tumor + empty_per_batch 个 empty，
+    每个 batch 保证 tumor_per_batch 个 tumor + empty_per_batch 个 empty，
     彻底消除全空 batch / 全肿瘤 batch 的可能。
 
-    原理：
-      1. 将 ConcatDataset 的索引按 tumor / empty 分成两个池
-      2. 每次 yield 一个 batch：从 tumor 池随机取 n_t 个，从 empty 池随机取 n_e 个
-      3. 两个池各自循环洗牌（无放回），池耗尽后重新 shuffle
-
     参数:
-      dataset         : ConcatDataset([tumor_ds, empty_ds])
+      dataset         : ConcatDataset([tumor_ds, neg_ds])
       n_tumor         : tumor 数据集的样本数（前 n_tumor 个索引属于 tumor）
       batch_size      : batch 大小
-      tumor_fraction  : 每个 batch 中 tumor 占比（默认 0.5 → N/2 tumor + N/2 empty）
+      tumor_fraction  : 每个 batch 中 tumor 占比（默认 1/3 → 1:2 比例）
     """
 
     def __init__(self, dataset, n_tumor, batch_size, tumor_fraction=0.5, seed=42):
@@ -283,25 +322,22 @@ class BalancedBatchSampler(Sampler):
         self.n_tumor   = n_tumor
         self.n_empty   = self.n_total - n_tumor
         self.bs        = batch_size
-        self.n_t       = max(1, int(batch_size * tumor_fraction))  # tumor per batch
-        self.n_e       = batch_size - self.n_t                     # empty per batch
+        self.n_t       = max(1, int(batch_size * tumor_fraction))
+        self.n_e       = batch_size - self.n_t
         self.seed      = seed
         self.rng       = random.Random(seed)
 
-        assert self.n_tumor > 0,  "No tumor samples found"
-        assert self.n_empty > 0,  "No empty samples found"
+        assert self.n_tumor > 0, "No tumor samples found"
+        assert self.n_empty > 0, "No empty samples found"
 
         self.tumor_idxs = list(range(n_tumor))
         self.empty_idxs = list(range(n_tumor, self.n_total))
-
-        # 每轮 epoch 总 iter 数：以 tumor 池能产出的轮次为准
         self.n_batches  = max(1, self.n_tumor // self.n_t)
 
     def __len__(self):
         return self.n_batches
 
     def __iter__(self):
-        # 打乱两个池
         t_pool = self.tumor_idxs.copy()
         e_pool = self.empty_idxs.copy()
         self.rng.shuffle(t_pool)
@@ -311,18 +347,16 @@ class BalancedBatchSampler(Sampler):
         e_ptr = 0
 
         for _ in range(self.n_batches):
-            # tumor: 池不够时重新 shuffle 循环
             if t_ptr + self.n_t > len(t_pool):
                 self.rng.shuffle(t_pool)
                 t_ptr = 0
-            # empty: 同上
             if e_ptr + self.n_e > len(e_pool):
                 self.rng.shuffle(e_pool)
                 e_ptr = 0
 
             batch = (t_pool[t_ptr:t_ptr + self.n_t]
                      + e_pool[e_ptr:e_ptr + self.n_e])
-            self.rng.shuffle(batch)   # 打乱 tumor/empty 顺序
+            self.rng.shuffle(batch)
             yield batch
 
             t_ptr += self.n_t
@@ -330,7 +364,7 @@ class BalancedBatchSampler(Sampler):
 
 
 # ============================================================
-#  IDDMGA LR Warmup（不变）
+#  IDDMGA / CSA LR Warmup
 # ============================================================
 
 def apply_iddmga_lr_warmup(optimizer, epoch, warmup_end_epoch,
@@ -341,8 +375,17 @@ def apply_iddmga_lr_warmup(optimizer, epoch, warmup_end_epoch,
         optimizer.param_groups[idx]['lr'] = lr
 
 
+def apply_csa_lr_warmup(optimizer, epoch, warmup_epochs,
+                         csa_lr_full, csa_group_idxs):
+    """[v7-C] CSA 参数组前 warmup_epochs 个 epoch 线性升至 csa_lr_full。"""
+    ratio = min(1.0, epoch / max(warmup_epochs, 1))
+    lr    = csa_lr_full * ratio
+    for idx in csa_group_idxs:
+        optimizer.param_groups[idx]['lr'] = lr
+
+
 # ============================================================
-#  [MODIFIED] Train Epoch — 分阶段控制
+#  Train Epoch
 # ============================================================
 
 def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler,
@@ -351,7 +394,6 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler,
                 clip_grad_norm=1.0):
     model.train()
     freeze_bn_stats(model)
-    # [FIX] 统一用 threshold=0.5，与推理一致
     metrics_fn = BoneOnlyDetailedMetrics(threshold=0.5)
 
     total_loss = 0.0
@@ -385,7 +427,6 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler,
             loss    = loss_fn(outputs, tumor_mask, bone_pred, is_tumor,
                               current_epoch=epoch, model=model)
 
-        # [FIX] 不再跳过空batch，因为空切片现在有FP loss梯度
         if torch.isnan(loss) or torch.isinf(loss):
             optimizer.zero_grad(set_to_none=True)
             del ct, pet, bone_pred, tumor_mask, outputs, loss
@@ -396,7 +437,7 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler,
         if loss_fn.last_total_loss > 0.0:
             all_bnd_total.append(loss_fn.last_total_loss)
 
-        (loss / accumulation_steps).backward()
+        scaler.scale(loss / accumulation_steps).backward()
 
         step = (batch_idx + 1) % accumulation_steps == 0
         last = (batch_idx + 1) == len(dataloader)
@@ -409,10 +450,9 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler,
 
         if batch_idx % 10 == 0:
             with torch.no_grad():
-                # [FIX] 使用硬Dice
                 m = metrics_fn(outputs['tumor_logits'], tumor_mask, bone_pred, is_tumor)
                 if m['num_tumor_slices'] > 0:
-                    all_tdice.append(m['tumor_dice'])      # 现在是硬Dice
+                    all_tdice.append(m['tumor_dice'])
                     all_tprec.append(m['tumor_precision'])
                     all_trecall.append(m['tumor_recall'])
                 if m['num_empty_slices'] > 0:
@@ -441,7 +481,7 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler,
     logger.info(f"\n{'='*70}")
     logger.info(f"Epoch {epoch:03d} [TRAIN]  {phase_desc}")
     logger.info(f"  Loss:      {total_loss/n:.4f}")
-    logger.info(f"  Dice@0.5:  {dice_val:.4f}   ← 硬Dice（已修复）")
+    logger.info(f"  Dice@0.5:  {dice_val:.4f}")
     logger.info(f"  Precision: {prec_val:.4f}")
     logger.info(f"  Recall:    {recall_val:.4f}")
     logger.info(f"  FP Rate:   {fp_val:.4f}")
@@ -463,9 +503,12 @@ def train_epoch(model, dataloader, optimizer, loss_fn, device, scaler,
     }
 
 
+# ============================================================
+#  Validate
+# ============================================================
+
 def validate(model, dataloader, loss_fn, device, epoch, logger):
     model.eval()
-    # [FIX] 只用一个metrics_fn，threshold=0.5，用硬Dice
     metrics_fn = BoneOnlyDetailedMetrics(threshold=0.5)
 
     total_loss = 0.0
@@ -486,7 +529,6 @@ def validate(model, dataloader, loss_fn, device, epoch, logger):
                                   current_epoch=epoch, model=None)
 
             logits = outputs['tumor_logits']
-            # [FIX] tumor_dice 现在是硬Dice
             m = metrics_fn(logits, tumor_mask, bone_pred, is_tumor)
 
             if m['num_tumor_slices'] > 0:
@@ -503,7 +545,7 @@ def validate(model, dataloader, loss_fn, device, epoch, logger):
                 'recall': f'{np.mean(all_recall):.3f}' if all_recall else '—',
                 'fp':     f'{np.mean(all_fp):.6f}'     if all_fp     else '—',
             })
-            del ct, pet, bone_pred, tumor_mask, outputs, loss, logits
+            del ct, pet, tumor_mask, outputs, loss, logits
 
     n      = len(dataloader)
     dice   = np.mean(all_dice)   if all_dice   else 0.0
@@ -514,7 +556,7 @@ def validate(model, dataloader, loss_fn, device, epoch, logger):
     logger.info(f"\n{'='*70}")
     logger.info(f"Epoch {epoch:03d} [VAL]")
     logger.info(f"  Loss:      {total_loss/n:.4f}")
-    logger.info(f"  Dice@0.5:  {dice:.4f}   ← 硬Dice主指标（已修复）")
+    logger.info(f"  Dice@0.5:  {dice:.4f}")
     logger.info(f"  Precision: {prec:.4f}")
     logger.info(f"  Recall:    {recall:.4f}")
     logger.info(f"  FP Rate:   {fp:.6f}")
@@ -534,89 +576,98 @@ def validate(model, dataloader, loss_fn, device, epoch, logger):
 # ============================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='IntraBone Phased Training v2')
+    parser = argparse.ArgumentParser(description='IntraBone Phased Training v7 (5-Slice CSA)')
 
     # 路径
     parser.add_argument('--data_root',         type=str,      default='data/img1')
-    parser.add_argument('--stage1_model_path', type=str,      default='checkpoints/stage1_2D_20260303-152807/best_model.pth')
+    parser.add_argument('--stage1_model_path', type=str,
+                        default='checkpoints/stage1_2D_20260303-152807/best_model.pth')
     parser.add_argument('--save_dir',          type=str,      default='checkpoints')
-    parser.add_argument('--exp_name',          type=str,      default='intrabone_phased_v2')
+    parser.add_argument('--exp_name',          type=str,      default='intrabone_phased_v7')
     parser.add_argument('--resume_from',       type=str,      default=None)
 
     # 数据
     parser.add_argument('--batch_size',        type=int,      default=4)
     parser.add_argument('--num_workers',       type=int,      default=4)
-    parser.add_argument('--min_tumor_pixels',  type=int,      default=100)
     parser.add_argument('--is_16bit',          type=str2bool, default=True)
     parser.add_argument('--train_empty_ratio', type=float,    default=2.0,
-                        help='训练集 empty:tumor 比例，2.0 = 1:2 (v5: 提高背景负样本)')  # [v5-I]
+                        help='训练集 neg:tumor 比例，2.0 = 1:2')
     parser.add_argument('--val_empty_ratio',   type=float,    default=5.0)
+    # [v7-E] 消除 min_tumor_pixels 过滤：默认 0 = 不过滤，包含所有肿瘤切片
+    parser.add_argument('--min_tumor_pixels',  type=int,      default=0,
+                        help='肿瘤切片最小像素阈值，0 表示不过滤（v7: 默认关闭过滤）')
 
     # 模型
-    parser.add_argument('--freeze_stage1',     type=str2bool, default=True)   # [v4-A]
+    parser.add_argument('--freeze_stage1',     type=str2bool, default=True)
     parser.add_argument('--bone_dilation',     type=int,      default=5)
     parser.add_argument('--iddmga_K',          type=int,      default=3)
 
+    # ─────────────────────────────────────────────────────────
+    # [CHANGE-5] CSA 超参（v7 新增）
+    # ─────────────────────────────────────────────────────────
+    parser.add_argument('--n_slices',            type=int,      default=5,
+                        help='输入切片数（目前固定 5）')
+    parser.add_argument('--csa_feat_ch',         type=int,      default=32,
+                        help='CSASliceFusion 中间特征维度')
+    parser.add_argument('--csa_n_heads',         type=int,      default=4,
+                        help='CSA 多头注意力头数')
+    parser.add_argument('--csa_pool_size',       type=int,      default=16,
+                        help='CSA 空间池化目标尺寸（控制内存/精度 trade-off）')
+    parser.add_argument('--csa_use_cross_modal', type=str2bool, default=True,
+                        help='PET→CT 跨模态辅助注意力')
+    parser.add_argument('--enable_encoder_csa',  type=str2bool, default=False,
+                        help='Encoder 中间层 CSA（开启后 5× backbone 计算量）')
+    parser.add_argument('--csa_warmup_epochs',   type=int,      default=5,
+                        help='CSA 参数组 LR 从 0 线性升至 main_lr 所需 epoch 数')
+
     # 学习率
     parser.add_argument('--ct_lr',             type=float,    default=3e-6)
-    parser.add_argument('--main_lr',           type=float,    default=2e-4)   # [v5-G] 1e-4 → 2e-4
+    parser.add_argument('--main_lr',           type=float,    default=2e-4)
     parser.add_argument('--iddmga_lr',         type=float,    default=2e-4)
     parser.add_argument('--lr_min',            type=float,    default=1e-7)
     parser.add_argument('--weight_decay',      type=float,    default=1e-4)
     parser.add_argument('--main_weight_decay', type=float,    default=3e-4)
 
-    # IDDMGA warmup（保留，保证 IRGDA 模块参数仍然走 LR warmup）
+    # IDDMGA warmup
     parser.add_argument('--iddmga_warmup_epochs', type=int,   default=10)
     parser.add_argument('--iddmga_warmup_start',  type=int,   default=5)
 
-    # [v5-E] 阶段边界提前
-    parser.add_argument('--phase2_start',      type=int,      default=20,
-                        help='BoundaryLoss + Precision Tversky 启用 epoch')
-    parser.add_argument('--phase3_start',      type=int,      default=35,
-                        help='IRGDA + FP suppress 启用 epoch')
+    # 阶段边界
+    parser.add_argument('--phase2_start',      type=int,      default=20)
+    parser.add_argument('--phase3_start',      type=int,      default=35)
     parser.add_argument('--ds_cutoff',         type=int,      default=40,
-                        help='Deep Supervision 关闭的 epoch（> ds_cutoff 后关闭）')
-    parser.add_argument('--irgda_rampup',      type=int,      default=15,
-                        help='IRGDA 权重线性升温轮数')
+                        help='Deep Supervision 关闭的 epoch')
+    parser.add_argument('--irgda_rampup',      type=int,      default=15)
 
-    # [v5-D] BoundaryLoss 提前
-    parser.add_argument('--boundary_delay_start',type=int,    default=15,
-                        help='BoundaryLoss warmup 实际开始的 epoch（原 30 → 15）')
-    parser.add_argument('--bnd_weight_max',      type=float,  default=0.05,
-                        help='BoundaryLoss 最大权重上限（原 0.03 → 0.05）')
-    parser.add_argument('--bnd_rampup_rate',     type=float,  default=0.003,
-                        help='BoundaryLoss 每 epoch 权重增量（原 0.002 → 0.003）')
-    parser.add_argument('--use_boundary_delay',  type=str2bool, default=True)
+    # BoundaryLoss
+    parser.add_argument('--boundary_delay_start', type=int,   default=15)
+    parser.add_argument('--bnd_weight_max',        type=float, default=0.05)
+    parser.add_argument('--bnd_rampup_rate',       type=float, default=0.003)
+    parser.add_argument('--use_boundary_delay',    type=str2bool, default=True)
 
-    # [v5-H] Cosine Scheduler 参数
-    parser.add_argument('--use_cosine',        type=str2bool, default=True,
-                        help='使用 CosineAnnealingWarmRestarts 替代 ReduceLROnPlateau')
-    parser.add_argument('--cosine_T0',         type=int,      default=80,
-                        help='Cosine 第一周期长度（v6: 80，避免 epoch50 重启破坏精调）')
-    parser.add_argument('--cosine_Tmult',      type=int,      default=2,
-                        help='Cosine 周期倍增系数')
+    # Cosine Scheduler
+    parser.add_argument('--use_cosine',        type=str2bool, default=True)
+    parser.add_argument('--cosine_T0',         type=int,      default=80)
+    parser.add_argument('--cosine_Tmult',      type=int,      default=2)
 
     # 训练
     parser.add_argument('--epochs',              type=int,    default=150)
     parser.add_argument('--accumulation_steps',  type=int,    default=4)
     parser.add_argument('--clip_grad_norm',      type=float,  default=1.0)
     parser.add_argument('--seed',                type=int,    default=42)
-    parser.add_argument('--early_stop_patience', type=int,    default=50,
-                        help='v6: 50（保证 Phase3 IRGDA 充分训练后再早停）')
+    parser.add_argument('--early_stop_patience', type=int,    default=50)
 
-    # [v6] Hard Negative 参数
-    parser.add_argument('--hard_neg_range',       type=int,   default=5,
-                        help='HardNeg 邻域半径（距肿瘤切片 ±N slice）')
-    parser.add_argument('--hard_neg_max_per_tumor', type=int, default=3,
-                        help='每个肿瘤切片最多采几个 hard negative')
+    # Hard Negative
+    parser.add_argument('--hard_neg_range',          type=int,   default=5)
+    parser.add_argument('--hard_neg_max_per_tumor',  type=int,   default=3)
 
     # Loss 权重
-    parser.add_argument('--irgda_sup_weight',    type=float,  default=0.001)
-    parser.add_argument('--fp_suppress_weight',  type=float,  default=0.03)
+    parser.add_argument('--irgda_sup_weight',   type=float,  default=0.001)
+    parser.add_argument('--fp_suppress_weight', type=float,  default=0.03)
 
-    # Scheduler (ReduceLROnPlateau fallback)
-    parser.add_argument('--scheduler_patience',  type=int,    default=15)
-    parser.add_argument('--scheduler_factor',    type=float,  default=0.5)
+    # Scheduler fallback
+    parser.add_argument('--scheduler_patience', type=int,    default=15)
+    parser.add_argument('--scheduler_factor',   type=float,  default=0.5)
 
     args = parser.parse_args()
     set_seed(args.seed)
@@ -630,24 +681,29 @@ def main():
 
     logger.info(f"""
 {'='*70}
-Intra-Bone Tumor Training — 分阶段稳定收敛版 v3
+Intra-Bone Tumor Training — v7 (5-Slice CSA)
 {'='*70}
 [阶段划分]
-  Phase 1  epoch  1~{args.phase2_start-1}: FTL + BCE（仅核心 loss）
+  Phase 1  epoch  1~{args.phase2_start-1}: FTL + BCE
   Phase 2  epoch {args.phase2_start}~{args.phase3_start-1}: + BoundaryLoss warmup
   Phase 3  epoch {args.phase3_start}+   : + IRGDA + FP suppress
 
-[BoundaryLoss v3 调度]
-  最大权重:     {args.bnd_weight_max}   (降幅: 0.15 → 0.03)
-  Warmup 速率:  +{args.bnd_rampup_rate}/epoch (15 epoch 到达上限)
-  延迟开关:     USE_BOUNDARY_DELAY={args.use_boundary_delay}
+[BoundaryLoss]
+  最大权重:     {args.bnd_weight_max}
+  Warmup 速率:  +{args.bnd_rampup_rate}/epoch
+  延迟开关:     {args.use_boundary_delay}
   延迟起始:     epoch {args.boundary_delay_start}
-  实际激活时间: epoch {args.boundary_delay_start if args.use_boundary_delay else args.phase2_start}
 
 [Deep Supervision]  epoch 1~{args.ds_cutoff}（之后关闭）
 [IRGDA]     epoch >= {args.phase3_start} 启用，线性升温 {args.irgda_rampup} epoch
-[FP suppress] epoch >= {args.phase3_start} 启用
-[Sampler]   BalancedBatchSampler (N/2 tumor + N/2 empty per batch)
+[Sampler]   BalancedBatchSampler (1:{args.train_empty_ratio:.1f} tumor:neg per batch)
+
+[CSA v7]
+  n_slices={args.n_slices}  feat_ch={args.csa_feat_ch}  n_heads={args.csa_n_heads}
+  pool_size={args.csa_pool_size}  cross_modal={args.csa_use_cross_modal}
+  encoder_csa={args.enable_encoder_csa}  csa_warmup={args.csa_warmup_epochs} epochs
+
+[v7-E] 肿瘤过滤已关闭 (min_tumor_pixels={args.min_tumor_pixels})
 
 [LR]  main={args.main_lr:.1e}  ct={args.ct_lr:.1e}  iddmga={args.iddmga_lr:.1e}
 [Grad] accum={args.accumulation_steps}  clip={args.clip_grad_norm}
@@ -661,6 +717,7 @@ Intra-Bone Tumor Training — 分阶段稳定收敛版 v3
     train_file = os.path.join(args.data_root, 'train_tumor.txt')
     val_file   = os.path.join(args.data_root, 'val_tumor.txt')
 
+    # [v7-E] min_tumor_pixels=0：不过滤小肿瘤切片，保留所有包含肿瘤的切片
     _, train_tumor_ds = get_intrabone_dataloader_512(
         data_root=args.data_root, split_file=train_file, mode='train',
         batch_size=args.batch_size, num_workers=args.num_workers,
@@ -681,9 +738,7 @@ Intra-Bone Tumor Training — 分阶段稳定收敛版 v3
     val_empty_ds   = EmptySliceDataset(all_val_ids,   args.data_root,
                                        mode='val',   is_16bit=args.is_16bit)
 
-    # ── [v6] Hard Negative Dataset 替换随机空切片 ──
-    # 使用距肿瘤切片 ±neg_range 的邻近无肿瘤切片作为负样本
-    # 这些"难负样本"骨结构与肿瘤切片相似，是 FP 的真实来源
+    # ── Hard Negative Dataset ──
     train_hard_neg = HardNegativeDataset(
         tumor_image_ids = list(train_tumor_ds.image_list),
         all_image_ids   = all_train_ids,
@@ -693,37 +748,34 @@ Intra-Bone Tumor Training — 分阶段稳定收敛版 v3
         is_16bit        = args.is_16bit,
         max_per_tumor   = args.hard_neg_max_per_tumor,
     )
-    # 若 hard negative 数量不足，用随机 empty 补充到目标比例
     n_train_tumor  = len(train_tumor_ds)
     n_hard_neg     = len(train_hard_neg)
     n_target_neg   = int(n_train_tumor * args.train_empty_ratio)
+
     if n_hard_neg < n_target_neg:
-        n_supplement = n_target_neg - n_hard_neg
-        n_supplement = min(n_supplement, len(train_empty_ds))
+        n_supplement = min(n_target_neg - n_hard_neg, len(train_empty_ds))
         _rng = random.Random(args.seed)
         supplement_ds = Subset(train_empty_ds,
                                _rng.sample(range(len(train_empty_ds)), n_supplement))
         neg_combined = ConcatDataset([train_hard_neg, supplement_ds])
         logger.info(f"  HardNeg: {n_hard_neg} hard + {n_supplement} random supplement\n")
     else:
-        # 截取到目标数量
         _rng = random.Random(args.seed)
         hard_sub = Subset(train_hard_neg,
                           _rng.sample(range(n_hard_neg), min(n_target_neg, n_hard_neg)))
         neg_combined = hard_sub
         logger.info(f"  HardNeg: {min(n_target_neg, n_hard_neg)} hard negative slices\n")
 
-    n_train_neg   = len(neg_combined)
+    n_train_neg    = len(neg_combined)
     train_combined = ConcatDataset([train_tumor_ds, neg_combined])
 
-    # [v6] tumor_fraction: tumor/(tumor+neg)
-    tumor_frac = 1.0 / (1.0 + args.train_empty_ratio)
+    tumor_frac    = 1.0 / (1.0 + args.train_empty_ratio)
     train_sampler = BalancedBatchSampler(
         train_combined,
-        n_tumor       = n_train_tumor,
-        batch_size    = args.batch_size,
-        tumor_fraction= tumor_frac,
-        seed          = args.seed)
+        n_tumor        = n_train_tumor,
+        batch_size     = args.batch_size,
+        tumor_fraction = tumor_frac,
+        seed           = args.seed)
 
     train_loader = DataLoader(
         train_combined,
@@ -737,7 +789,7 @@ Intra-Bone Tumor Training — 分阶段稳定收敛版 v3
                 f"(hard_neg={n_hard_neg}, ratio 1:{args.train_empty_ratio:.1f})  "
                 f"batches/epoch={len(train_sampler)}\n")
 
-    # ── 验证集：同样使用 HardNeg（val split 的邻近切片）──
+    # ── 验证集 ──
     val_hard_neg = HardNegativeDataset(
         tumor_image_ids = list(val_tumor_ds.image_list),
         all_image_ids   = all_val_ids,
@@ -747,9 +799,8 @@ Intra-Bone Tumor Training — 分阶段稳定收敛版 v3
         is_16bit        = args.is_16bit,
         max_per_tumor   = args.hard_neg_max_per_tumor,
     )
-    n_val_tumor = len(val_tumor_ds)
-    n_val_hard  = len(val_hard_neg)
-    # 验证集补充随机 empty 到 1:3.87（原始比例）
+    n_val_tumor  = len(val_tumor_ds)
+    n_val_hard   = len(val_hard_neg)
     n_val_target = int(n_val_tumor * args.val_empty_ratio)
     if n_val_hard < n_val_target:
         n_val_sup = min(n_val_target - n_val_hard, len(val_empty_ds))
@@ -771,17 +822,29 @@ Intra-Bone Tumor Training — 分阶段稳定收敛版 v3
     logger.info(f"Val:   {n_val_tumor} tumor + {len(val_neg)} neg "
                 f"(hard={n_val_hard}, ratio 1:{len(val_neg)/max(n_val_tumor,1):.2f})\n")
 
-    # ── 模型 ──
+    # ─────────────────────────────────────────────────────────
+    # [CHANGE-3] 模型 — 5-Slice CSA 版
+    # ─────────────────────────────────────────────────────────
     model = FBFAIntraBoneTumorSegmentation(
         stage1_model_path       = args.stage1_model_path,
         freeze_stage1           = args.freeze_stage1,
         bone_dilation           = args.bone_dilation,
         enable_deep_supervision = True,
+        # CSA 参数
+        n_slices                = args.n_slices,
+        csa_feat_ch             = args.csa_feat_ch,
+        csa_n_heads             = args.csa_n_heads,
+        csa_pool_size           = args.csa_pool_size,
+        csa_use_cross_modal     = args.csa_use_cross_modal,
+        enable_encoder_csa      = args.enable_encoder_csa,
+        # DGMA
         dgma_K_max              = args.iddmga_K,
+        dgma_nms_threshold      = 0.3,
+        dgma_min_spatial_size   = 65,
     ).to(device)
 
-    # Resume
-    start_epoch    = 1
+    # ── Resume ──
+    start_epoch       = 1
     _resume_opt_state = None
     if args.resume_from and os.path.exists(args.resume_from):
         logger.info(f"[Resume] Loading from {args.resume_from}")
@@ -800,7 +863,9 @@ Intra-Bone Tumor Training — 分阶段稳定收敛版 v3
 
     freeze_bn_stats(model)
 
-    # ── Optimizer（6组 weight-decay 分离，不变）──
+    # ─────────────────────────────────────────────────────────
+    # [CHANGE-4] Optimizer — 8组（新增 csa_no_wd / csa_wd）
+    # ─────────────────────────────────────────────────────────
     def _split_wd(named_params_list):
         no_wd, wd = [], []
         for name, param in named_params_list:
@@ -819,69 +884,92 @@ Intra-Bone Tumor Training — 分阶段稳定收敛版 v3
     ct_named     = [(n, p) for n, p in model.named_parameters() if 'ct_branch' in n]
     iddmga_named = [(n, p) for n, p in model.named_parameters()
                     if 'soe' in n and 'ct_branch' not in n]
+    # [v7-C] CSA 参数组（csa_fusion 模块，不属于 ct_branch / soe）
+    csa_named    = [(n, p) for n, p in model.named_parameters() if 'csa_fusion' in n]
     main_named   = [(n, p) for n, p in model.named_parameters()
-                    if 'ct_branch' not in n and 'soe' not in n]
+                    if 'ct_branch' not in n
+                    and 'soe'       not in n
+                    and 'csa_fusion' not in n]
 
     ct_no_wd,     ct_wd     = _split_wd(ct_named)
     main_no_wd,   main_wd   = _split_wd(main_named)
     iddmga_no_wd, iddmga_wd = _split_wd(iddmga_named)
+    csa_no_wd,    csa_wd    = _split_wd(csa_named)
 
     IDDMGA_GROUP_IDXS = [4, 5]
+    CSA_GROUP_IDXS    = [6, 7]   # [v7-C]
 
     optimizer = torch.optim.AdamW([
+        # idx 0
         {'params': ct_no_wd,     'lr': args.ct_lr,     'weight_decay': 0.0,                   'name': 'ct_no_wd'},
+        # idx 1
         {'params': ct_wd,        'lr': args.ct_lr,     'weight_decay': args.weight_decay,      'name': 'ct_wd'},
+        # idx 2
         {'params': main_no_wd,   'lr': args.main_lr,   'weight_decay': 0.0,                   'name': 'main_no_wd'},
+        # idx 3
         {'params': main_wd,      'lr': args.main_lr,   'weight_decay': args.main_weight_decay, 'name': 'main_wd'},
+        # idx 4
         {'params': iddmga_no_wd, 'lr': args.iddmga_lr, 'weight_decay': 0.0,                   'name': 'iddmga_no_wd'},
+        # idx 5
         {'params': iddmga_wd,    'lr': args.iddmga_lr, 'weight_decay': args.weight_decay,      'name': 'iddmga_wd'},
+        # idx 6  [v7-C] CSA warmup：初始 lr=0，由 apply_csa_lr_warmup 线性升至 main_lr
+        {'params': csa_no_wd,    'lr': 0.0,            'weight_decay': 0.0,                   'name': 'csa_no_wd'},
+        # idx 7
+        {'params': csa_wd,       'lr': 0.0,            'weight_decay': args.main_weight_decay, 'name': 'csa_wd'},
     ], betas=(0.9, 0.999), eps=1e-8)
 
     if _resume_opt_state is not None:
         try:
             optimizer.load_state_dict(_resume_opt_state)
             lr_map = {
-                'ct_no_wd':     args.ct_lr,   'ct_wd':        args.ct_lr,
-                'main_no_wd':   args.main_lr,  'main_wd':      args.main_lr,
-                'iddmga_no_wd': args.iddmga_lr,'iddmga_wd':    args.iddmga_lr,
+                'ct_no_wd':     args.ct_lr,
+                'ct_wd':        args.ct_lr,
+                'main_no_wd':   args.main_lr,
+                'main_wd':      args.main_lr,
+                'iddmga_no_wd': args.iddmga_lr,
+                'iddmga_wd':    args.iddmga_lr,
+                'csa_no_wd':    args.main_lr,
+                'csa_wd':       args.main_lr,
             }
             for g in optimizer.param_groups:
                 name = g.get('name', '')
                 if name in lr_map:
                     g['lr'] = lr_map[name]
-            logger.info(f"  Optimizer restored; LR overridden")
+            logger.info("  Optimizer restored; LR overridden")
         except Exception as e:
             logger.warning(f"  Optimizer load failed ({e}), using fresh optimizer")
 
     # ── Loss ──
     base_loss_fn = SmallTumorLoss(
-        ftl_weight=2.0,
-        bce_weight=0.5,
-        bnd_weight_max=args.bnd_weight_max,       # [v5-D] 0.03 → 0.05
-        bnd_rampup_rate=args.bnd_rampup_rate,     # [v5-D] 0.002 → 0.003
-        alpha=0.4,            # [v5-A] 0.3 → 0.4（增加 FP 惩罚）
-        beta=0.6,             # [v5-A] 0.70 → 0.6
-        gamma=2.0,            # [v5-B] 1.5 → 2.0（难分 FP 更大梯度）
-        boundary_weight=5.0,
-        phase2_start=args.phase2_start,           # [v5-E] 25 → 20
-        use_boundary_delay=args.use_boundary_delay,
-        boundary_delay_start=args.boundary_delay_start,  # [v5-D] 30 → 15
-        ds_cutoff=args.ds_cutoff)
+        ftl_weight           = 2.0,
+        bce_weight           = 0.5,
+        bnd_weight_max       = args.bnd_weight_max,
+        bnd_rampup_rate      = args.bnd_rampup_rate,
+        alpha                = 0.4,
+        beta                 = 0.6,
+        gamma                = 2.0,
+        boundary_weight      = 5.0,
+        phase2_start         = args.phase2_start,
+        use_boundary_delay   = args.use_boundary_delay,
+        boundary_delay_start = args.boundary_delay_start,
+        ds_cutoff            = args.ds_cutoff,
+        fp_weight_base       = 0.02)
 
     loss_fn = SingleStageLoss(
         base_loss_fn,
-        irgda_sup_weight   = args.irgda_sup_weight,   # [MODIFIED]
-        fp_suppress_weight = args.fp_suppress_weight,  # [MODIFIED]
-        irgda_start_epoch  = args.phase3_start,        # [MODIFIED]
-        fp_start_epoch     = args.phase3_start,        # [MODIFIED]
-        irgda_rampup_epochs= args.irgda_rampup)        # [MODIFIED]
+        irgda_sup_weight    = args.irgda_sup_weight,
+        fp_suppress_weight  = args.fp_suppress_weight,
+        irgda_start_epoch   = args.phase3_start,
+        fp_start_epoch      = args.phase3_start,
+        irgda_rampup_epochs = args.irgda_rampup)
 
-    # [v5-H] Cosine scheduler（T0=50 防早期 LR 衰减过快）
+    # ── Scheduler ──
     if args.use_cosine:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer, T_0=args.cosine_T0, T_mult=args.cosine_Tmult,
             eta_min=args.lr_min)
-        logger.info(f"Scheduler: CosineAnnealingWarmRestarts T0={args.cosine_T0} Tmult={args.cosine_Tmult}\n")
+        logger.info(f"Scheduler: CosineAnnealingWarmRestarts "
+                    f"T0={args.cosine_T0} Tmult={args.cosine_Tmult}\n")
     else:
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer, mode='max', factor=args.scheduler_factor,
@@ -894,13 +982,13 @@ Intra-Bone Tumor Training — 分阶段稳定收敛版 v3
     best_epoch = 0
 
     logger.info("=" * 70)
-    logger.info("Starting Training (Phased v2)...")
+    logger.info("Starting Training (v7 5-Slice CSA)...")
     logger.info("=" * 70 + "\n")
 
     for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
 
-        # ── IDDMGA LR Warmup（逻辑不变）──
+        # ── IDDMGA LR Warmup ──
         warmup_start = args.iddmga_warmup_start
         warmup_end   = warmup_start + args.iddmga_warmup_epochs
         if epoch < warmup_start:
@@ -913,62 +1001,63 @@ Intra-Bone Tumor Training — 分阶段稳定收敛版 v3
                 iddmga_lr_full    = args.iddmga_lr,
                 iddmga_group_idxs = IDDMGA_GROUP_IDXS)
 
-        # [v6] Phase2 精度优先模式：切换幅度收窄（v5 beta=0.45 导致 Recall 崩至 0.63）
+        # ── [v7-C] CSA LR Warmup（前 csa_warmup_epochs 个 epoch）──
+        if epoch <= args.csa_warmup_epochs:
+            apply_csa_lr_warmup(
+                optimizer, epoch,
+                warmup_epochs  = args.csa_warmup_epochs,
+                csa_lr_full    = args.main_lr,
+                csa_group_idxs = CSA_GROUP_IDXS)
+
+        # ── [v6] Phase2 温和精度优先模式 ──
         if epoch == args.phase2_start:
-            loss_fn.tumor_loss.alpha = 0.48   # 原 0.55，收窄避免 Recall 下崩
-            loss_fn.tumor_loss.beta  = 0.52   # 原 0.45，保持对 FN 的适当惩罚
-            loss_fn.tumor_loss.gamma = 2.0    # 原 2.5
+            loss_fn.tumor_loss.alpha = 0.48
+            loss_fn.tumor_loss.beta  = 0.52
+            loss_fn.tumor_loss.gamma = 2.0
             loss_fn.tumor_loss.ftl.tversky.alpha = 0.48
             loss_fn.tumor_loss.ftl.tversky.beta  = 0.52
             loss_fn.tumor_loss.ftl.gamma         = 2.0
             logger.info(f"[v6] Phase2 Switch @ epoch {epoch}: "
-                        f"alpha=0.48, beta=0.52, gamma=2.0 → 温和精度优化（保 Recall≥0.68）")
-
-        # ── [MODIFIED] 每轮重新 shuffle BalancedBatchSampler（更新 rng）──
-        # BalancedBatchSampler 的 __iter__ 会自动重新 shuffle，无需额外操作
+                        f"alpha=0.48, beta=0.52, gamma=2.0")
 
         train_m = train_epoch(
             model, train_loader, optimizer, loss_fn, device, scaler,
             epoch, logger,
-            accumulation_steps = args.accumulation_steps,  # [MODIFIED] 4
-            clip_grad_norm     = args.clip_grad_norm)       # [MODIFIED] 1.0
+            accumulation_steps = args.accumulation_steps,
+            clip_grad_norm     = args.clip_grad_norm)
 
         val_m = validate(model, val_loader, loss_fn, device, epoch, logger)
 
         cur_dice = val_m['tumor_dice']
-        # [v5-H] Cosine 按 epoch 步进；Plateau 按 dice 步进
         if args.use_cosine:
             scheduler.step(epoch)
         else:
             scheduler.step(cur_dice)
 
-        writer.add_scalar('Train/Loss',    train_m['loss'],          epoch)
-        writer.add_scalar('Train/Dice',    train_m['tumor_dice'],    epoch)
-        writer.add_scalar('Train/Recall',  train_m['tumor_recall'],  epoch)
-        writer.add_scalar('Train/FP',      train_m['empty_fp_rate'], epoch)
-        # BoundaryLoss 专项曲线
-        writer.add_scalar('BndLoss/Weight', train_m['bnd_weight'],   epoch)
-        writer.add_scalar('BndLoss/RawVal', train_m['bnd_loss'],     epoch)
-        writer.add_scalar('BndLoss/Ratio',  train_m['bnd_ratio'],    epoch)
-        # [v5-J] 验证双阈值 Dice + 置信度差值
-        writer.add_scalar('Val/Loss',           val_m['loss'],            epoch)
-        writer.add_scalar('Val/Dice_05_raw',   val_m['tumor_dice'],      epoch)
-        writer.add_scalar('Val/Dice_05_post',  val_m['tumor_dice_pp'],   epoch)
-        writer.add_scalar('Val/Dice_03',       val_m['tumor_dice_03'],   epoch)
-        writer.add_scalar('Val/ConfidenceGap', val_m['confidence_gap'],  epoch)
-        writer.add_scalar('Val/Precision',     val_m['tumor_precision'], epoch)
-        writer.add_scalar('Val/Recall',        val_m['tumor_recall'],    epoch)
-        writer.add_scalar('Val/FP',            val_m['empty_fp_rate'],   epoch)
-        writer.add_scalar('LR/CT',    optimizer.param_groups[1]['lr'], epoch)
-        writer.add_scalar('LR/Main',  optimizer.param_groups[3]['lr'], epoch)
-        writer.add_scalar('LR/IDDMGA',optimizer.param_groups[5]['lr'], epoch)
+        # ── TensorBoard ──
+        writer.add_scalar('Train/Loss',       train_m['loss'],          epoch)
+        writer.add_scalar('Train/Dice',       train_m['tumor_dice'],    epoch)
+        writer.add_scalar('Train/Recall',     train_m['tumor_recall'],  epoch)
+        writer.add_scalar('Train/FP',         train_m['empty_fp_rate'], epoch)
+        writer.add_scalar('BndLoss/Weight',   train_m['bnd_weight'],    epoch)
+        writer.add_scalar('BndLoss/RawVal',   train_m['bnd_loss'],      epoch)
+        writer.add_scalar('BndLoss/Ratio',    train_m['bnd_ratio'],     epoch)
+        writer.add_scalar('Val/Loss',         val_m['loss'],            epoch)
+        writer.add_scalar('Val/Dice',         val_m['tumor_dice'],      epoch)
+        writer.add_scalar('Val/Precision',    val_m['tumor_precision'], epoch)
+        writer.add_scalar('Val/Recall',       val_m['tumor_recall'],    epoch)
+        writer.add_scalar('Val/FP',           val_m['empty_fp_rate'],   epoch)
+        writer.add_scalar('LR/CT',     optimizer.param_groups[1]['lr'], epoch)
+        writer.add_scalar('LR/Main',   optimizer.param_groups[3]['lr'], epoch)
+        writer.add_scalar('LR/IDDMGA', optimizer.param_groups[5]['lr'], epoch)
+        writer.add_scalar('LR/CSA',    optimizer.param_groups[7]['lr'], epoch)  # [v7-C]
 
-        # [v5-K] 保存条件：prec≥0.35, recall≥0.55（放宽自 0.45/0.65）
+        # ── 保存 ──
         cur_prec   = val_m['tumor_precision']
         cur_recall = val_m['tumor_recall']
-        prec_ok   = cur_prec   >= 0.35
-        recall_ok = cur_recall >= 0.55
-        is_best   = (cur_dice > best_dice) and prec_ok and recall_ok
+        prec_ok    = cur_prec   >= 0.35
+        recall_ok  = cur_recall >= 0.55
+        is_best    = (cur_dice > best_dice) and prec_ok and recall_ok
         if not is_best and cur_dice > best_dice and epoch <= 20:
             is_best = True
 
@@ -979,27 +1068,24 @@ Intra-Bone Tumor Training — 分阶段稳定收敛版 v3
                 'epoch':                epoch,
                 'model_state_dict':     model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'dice_raw':             best_dice,           # 主指标 raw @0.5
-                'dice_post':            val_m['tumor_dice_pp'],
-                'dice_03':              val_m['tumor_dice_03'],
-                'confidence_gap':       val_m['confidence_gap'],
+                'dice':                 best_dice,
                 'precision':            val_m['tumor_precision'],
                 'recall':               val_m['tumor_recall'],
                 'fp_rate':              val_m['empty_fp_rate'],
                 'args':                 vars(args),
             }, os.path.join(save_dir, 'best_model.pth'))
-            logger.info(f"  [Best] Dice@0.5(raw)={best_dice:.4f} "
-                        f"Dice@0.5(post)={val_m['tumor_dice_pp']:.4f} "
-                        f"Dice@0.3={val_m['tumor_dice_03']:.4f} "
+            logger.info(f"  [Best] Dice@0.5={best_dice:.4f} "
                         f"Prec={val_m['tumor_precision']:.4f} "
                         f"Recall={val_m['tumor_recall']:.4f} "
-                        f"FP={val_m['empty_fp_rate']:.6f}\n")
+                        f"FP={val_m['empty_fp_rate']:.6f}")
 
-        logger.info(f"  Epoch {epoch} | Time={int(time.time()-t0)}s | "
-                    f"LR_ct={optimizer.param_groups[1]['lr']:.2e} | "
-                    f"LR_main={optimizer.param_groups[3]['lr']:.2e} | "
-                    f"LR_iddmga={optimizer.param_groups[5]['lr']:.2e}\n"
-                    f"  Best: Dice@0.5={best_dice:.4f} (epoch {best_epoch})\n")
+        logger.info(
+            f"  Epoch {epoch} | Time={int(time.time()-t0)}s | "
+            f"LR_ct={optimizer.param_groups[1]['lr']:.2e} | "
+            f"LR_main={optimizer.param_groups[3]['lr']:.2e} | "
+            f"LR_iddmga={optimizer.param_groups[5]['lr']:.2e} | "
+            f"LR_csa={optimizer.param_groups[7]['lr']:.2e}\n"   # [v7-C]
+            f"  Best: Dice@0.5={best_dice:.4f} (epoch {best_epoch})\n")
 
         if early_stopper(cur_dice):
             logger.info(f"Early stopping at epoch {epoch} "
